@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import itertools
 import io
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +32,24 @@ def _to_float(x: str) -> float:
         return 0.0
     v = float(x)
     return -v if neg else v
+
+
+def _try_parse_money(v):
+    """
+    Returns float if value looks like a number/money, else None.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s in ("", "-", "—", "–", "nan", "None"):
+        return None
+    # fast check: must contain a digit
+    if not any(ch.isdigit() for ch in s):
+        return None
+    try:
+        return _to_float(s)
+    except Exception:
+        return None
 
 
 def _parse_date(s: str) -> datetime:
@@ -103,84 +123,121 @@ def _parse_tranche_principal_from_tables(html: str):
     """
     Robust principal roll-forward parser using HTML tables.
 
-    Returns (begin_bal, prn_paid, end_bal) dicts keyed by tranche short name like 'A-1'
+    Works even when tables have no usable headers (columns named '0','1',...).
+    It infers (Begin, PrincipalPaid, End) by minimizing: |(Begin - Paid) - End|.
     """
     tables = pd.read_html(io.StringIO(html), flavor="lxml")
     name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
+
+    best = None  # (score, df, name_col, begin_idx, prn_idx, end_idx)
 
     for raw in tables:
         if raw is None or raw.empty:
             continue
 
         df = raw.copy()
-        df = _flatten_cols(df)
-        # Drop fully empty rows
-        df = df.dropna(how="all")
+        df = _flatten_cols(df).dropna(how="all")
         if df.empty or df.shape[1] < 3:
             continue
 
-        # Find which column likely contains tranche labels by scanning for "Class ... Notes"
+        # Find tranche rows and which column contains the tranche label most often
         str_df = df.astype(str)
-        match_counts = {}
-        for col in df.columns:
-            match_counts[col] = str_df[col].str.contains(name_pat, na=False).sum()
-
-        # If no column has at least 2 matches, this probably isn't the tranche table
+        match_counts = {col: str_df[col].str.contains(name_pat, na=False).sum() for col in df.columns}
         name_col = max(match_counts, key=match_counts.get)
         if match_counts[name_col] < 2:
             continue
 
-        cols_lower = [c.lower() for c in df.columns]
-
-        # Identify begin/end/principal columns by flexible keyword scoring
-        begin_idx = _best_col_by_keywords(
-            cols_lower,
-            include_any=["begin", "opening"],
-            include_all=["balance"],
-            exclude_any=["end", "ending"],
-        )
-        end_idx = _best_col_by_keywords(
-            cols_lower,
-            include_any=["end", "ending", "closing"],
-            include_all=["balance"],
-            exclude_any=["begin", "opening"],
-        )
-        prn_idx = _best_col_by_keywords(
-            cols_lower,
-            include_any=["principal", "distribution", "payment", "paid"],
-            include_all=[],
-            exclude_any=["interest", "begin", "opening", "end", "ending", "closing", "balance"],
-        )
-
-        if begin_idx is None or end_idx is None or prn_idx is None:
-            # not the right table
-            continue
-
-        begin_bal, prn_paid, end_bal = {}, {}, {}
-
-        for _, row in df.iterrows():
-            # Try to get tranche name from the detected name column; if not found, scan row
+        # Collect tranche rows
+        tranche_rows = []
+        tranche_names = []
+        for idx, row in df.iterrows():
             m = name_pat.search(str(row[name_col]))
             if not m:
+                # scan row cells
                 for cell in row.values:
                     mm = name_pat.search(str(cell))
                     if mm:
                         m = mm
                         break
-            if not m:
-                continue
+            if m:
+                tranche_rows.append(idx)
+                tranche_names.append(m.group(1).strip())
 
-            name = m.group(1).strip()
+        if len(tranche_rows) < 2:
+            continue
 
-            begin_bal[name] = _to_float(row.iloc[begin_idx])
-            prn_paid[name] = _to_float(row.iloc[prn_idx])
-            end_bal[name] = _to_float(row.iloc[end_idx])
+        # Identify numeric columns (by content), not by header
+        col_vals = {}
+        for j, col in enumerate(df.columns):
+            vals = []
+            for idx in tranche_rows:
+                v = _try_parse_money(df.loc[idx, col])
+                if v is not None and math.isfinite(v):
+                    vals.append(v)
+                else:
+                    vals.append(None)
+            # keep columns that have enough numeric values
+            if sum(x is not None for x in vals) >= 2:
+                col_vals[j] = vals
 
-        if begin_bal:
-            return begin_bal, prn_paid, end_bal
+        if len(col_vals) < 3:
+            continue
 
-    # If we got here, none of the tables parsed
-    return {}, {}, {}
+        col_indices = list(col_vals.keys())
+
+        # Score permutations of triples: choose (begin, principal, end) that best fit begin - principal = end
+        for a, b, c in itertools.combinations(col_indices, 3):
+            for begin_idx, prn_idx, end_idx in itertools.permutations([a, b, c], 3):
+                err_sum = 0.0
+                used = 0
+                bad = 0
+
+                for r_i in range(len(tranche_rows)):
+                    vb = col_vals[begin_idx][r_i]
+                    vp = col_vals[prn_idx][r_i]
+                    ve = col_vals[end_idx][r_i]
+                    if vb is None or vp is None or ve is None:
+                        continue
+
+                    used += 1
+                    # sanity: balances should be non-negative mostly; principal paid non-negative mostly
+                    if vb < -1e-6 or ve < -1e-6:
+                        bad += 1
+                    # equation error
+                    err = abs((vb - vp) - ve)
+                    err_sum += err
+
+                if used < 2:
+                    continue
+
+                avg_err = err_sum / used
+                # penalize weird assignments
+                score = avg_err + (bad * 1e6) + (1e3 / used)
+
+                if best is None or score < best[0]:
+                    best = (score, df, name_col, begin_idx, prn_idx, end_idx, tranche_rows, tranche_names)
+
+    if best is None:
+        return {}, {}, {}
+
+    _, df, name_col, begin_idx, prn_idx, end_idx, tranche_rows, tranche_names = best
+
+    begin_bal, prn_paid, end_bal = {}, {}, {}
+    for idx, name in zip(tranche_rows, tranche_names):
+        begin_bal[name] = _to_float(df.iloc[df.index.get_loc(idx), begin_idx])
+        prn_paid[name] = _to_float(df.iloc[df.index.get_loc(idx), prn_idx])
+        end_bal[name] = _to_float(df.iloc[df.index.get_loc(idx), end_idx])
+
+    # Sometimes BMW prints principal as negative (rare). Force principal paid positive if it fixes identity.
+    # If principal is negative but begin - (-p) moves away from end, flip sign.
+    for k in list(begin_bal.keys()):
+        b = begin_bal[k]
+        p = prn_paid[k]
+        e = end_bal[k]
+        if abs((b - p) - e) > abs((b - abs(p)) - e):
+            prn_paid[k] = abs(p)
+
+    return begin_bal, prn_paid, end_bal
 
 def _find_date(txt: str, label: str) -> datetime:
     # Accept label with/without colon (BMW sometimes changes)
