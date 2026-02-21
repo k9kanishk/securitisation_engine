@@ -11,15 +11,24 @@ from dateutil import parser as dtparser
 from .sec_edgar import SECEdgarClient
 
 
-_MONEY = r"([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})"
+_MONEY = r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)"  # allow optional decimals
 _DATE = r"([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})"
 
 
 def _to_float(x: str) -> float:
-    x = x.strip()
-    if x in ("-", "—", "–", ""):
+    x = str(x).strip()
+    if x in ("-", "—", "–", "", "nan", "None"):
         return 0.0
-    return float(x.replace(",", ""))
+    # parentheses for negatives
+    neg = False
+    if x.startswith("(") and x.endswith(")"):
+        neg = True
+        x = x[1:-1].strip()
+    x = x.replace("$", "").replace(",", "").strip()
+    if x == "":
+        return 0.0
+    v = float(x)
+    return -v if neg else v
 
 
 def _parse_date(s: str) -> datetime:
@@ -44,6 +53,101 @@ def _strip_html(html: str) -> str:
     txt = re.sub(r"\s+", " ", txt).strip()
     return txt
 
+
+
+
+def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+    # Handles MultiIndex columns from read_html
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join([str(x) for x in col if str(x) != "nan"]).strip() for col in df.columns.values]
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _find_col(cols_lower, *keywords):
+    for i, c in enumerate(cols_lower):
+        if all(k in c for k in keywords):
+            return i
+    return None
+
+
+def _parse_tranche_principal_from_tables(html: str):
+    """
+    Try to parse a principal roll-forward table from Exhibit 99.1 HTML using read_html.
+    Returns: (begin_bal, prn_paid, end_bal) dicts keyed by tranche short name like 'A-1'
+    """
+    # read_html may throw if no tables
+    tables = pd.read_html(html, flavor="lxml")
+    candidates = []
+
+    for df in tables:
+        if df is None or df.empty:
+            continue
+        df = _flatten_cols(df)
+        if df.shape[1] < 3:
+            continue
+
+        cols_lower = [c.lower() for c in df.columns]
+
+        # We expect something like:
+        # [Class/Notes] [Beginning ...] [Principal ...] [Ending ...]
+        has_begin = any("begin" in c for c in cols_lower)
+        has_end = any("end" in c for c in cols_lower)
+        has_prn = any(("principal" in c) or ("distribution" in c) or ("payment" in c) for c in cols_lower)
+
+        if not (has_begin and has_end and has_prn):
+            continue
+
+        # First column should contain class names
+        first_col = df.iloc[:, 0].astype(str)
+        if not first_col.str.contains("class", case=False, na=False).any():
+            # sometimes it doesn't contain the word 'Class' in every row, but still has tranche names
+            # keep it if it contains 'Notes' in some rows
+            if not first_col.str.contains("notes", case=False, na=False).any():
+                continue
+
+        candidates.append(df)
+
+    if not candidates:
+        return {}, {}, {}
+
+    # Pick the widest candidate (usually the real principal table)
+    df = max(candidates, key=lambda d: d.shape[1])
+    df = df.copy()
+    df = _flatten_cols(df)
+    cols_lower = [c.lower() for c in df.columns]
+
+    # Identify columns by keywords
+    begin_idx = _find_col(cols_lower, "begin")  # "Beginning Note Balance"
+    end_idx = _find_col(cols_lower, "end")      # "Ending Note Balance"
+
+    # principal column can be "Principal Distribution", "Principal Payment", etc.
+    prn_idx = None
+    for i, c in enumerate(cols_lower):
+        if ("principal" in c or "distribution" in c or "payment" in c) and ("begin" not in c) and ("end" not in c):
+            prn_idx = i
+            break
+
+    if begin_idx is None or end_idx is None or prn_idx is None:
+        return {}, {}, {}
+
+    begin_bal = {}
+    prn_paid = {}
+    end_bal = {}
+
+    name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
+
+    for _, row in df.iterrows():
+        label = str(row.iloc[0])
+        m = name_pat.search(label)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        begin_bal[name] = _to_float(row.iloc[begin_idx])
+        prn_paid[name] = _to_float(row.iloc[prn_idx])
+        end_bal[name] = _to_float(row.iloc[end_idx])
+
+    return begin_bal, prn_paid, end_bal
 
 def _find_date(txt: str, label: str) -> datetime:
     # Accept label with/without colon (BMW sometimes changes)
@@ -150,28 +254,30 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
         name = short.strip()
         tranche_coupon[name] = float(rate) / 100.0
 
-    # Principal table parsing (Class ... Notes $ begin $ pay $ end)
-    # Example:
-    # "Class A-1 Notes $ 225,271,573.82 $ 63,394,229.81 $ 161,877,344.01"
-    principal_pat = re.compile(
-        r"(Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes)\s*\$\s*"
-        + _MONEY
-        + r"\s*\$\s*("
-        + _MONEY
-        + r"|[-—–])\s*\$\s*"
-        + _MONEY,
-        flags=re.IGNORECASE,
-    )
+    # --- Tranche principal roll-forward: use HTML tables first (robust) ---
+    begin_bal, prn_paid, end_bal = _parse_tranche_principal_from_tables(html)
 
-    begin_bal: Dict[str, float] = {}
-    prn_paid: Dict[str, float] = {}
-    end_bal: Dict[str, float] = {}
+    # Fallback to old regex approach if table parsing fails (kept as backup)
+    if not begin_bal:
+        principal_pat = re.compile(
+            r"(Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes)\s*\$?\s*"
+            + _MONEY
+            + r"\s*\$?\s*("
+            + _MONEY
+            + r"|[-—–])\s*\$?\s*"
+            + _MONEY,
+            flags=re.IGNORECASE,
+        )
 
-    for _full, short, b, p, e in principal_pat.findall(txt):
-        name = short.strip()
-        begin_bal[name] = _to_float(b)
-        prn_paid[name] = _to_float(p)
-        end_bal[name] = _to_float(e)
+        begin_bal = {}
+        prn_paid = {}
+        end_bal = {}
+
+        for _full, short, b, p, e in principal_pat.findall(txt):
+            name = short.strip()
+            begin_bal[name] = _to_float(b)
+            prn_paid[name] = _to_float(p)
+            end_bal[name] = _to_float(e)
 
     if not begin_bal:
         raise ValueError("Could not parse tranche principal table (begin/pay/end) from Exhibit 99.1")
