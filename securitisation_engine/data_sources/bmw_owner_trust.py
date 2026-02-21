@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 
 import pandas as pd
+from dateutil import parser as dtparser
 
 from .sec_edgar import SECEdgarClient
 
@@ -23,12 +24,17 @@ def _to_float(x: str) -> float:
 
 def _parse_date(s: str) -> datetime:
     s = s.strip()
-    for fmt in ("%m/%d/%y", "%m/%d/%Y"):
+    # Try known formats first (fast + deterministic)
+    for fmt in ("%m/%d/%y", "%m/%d/%Y", "%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
             pass
-    raise ValueError(f"Unparseable date: {s}")
+    # Fallback: dateutil handles lots of weirdness
+    try:
+        return dtparser.parse(s, dayfirst=False)
+    except Exception as e:
+        raise ValueError(f"Unparseable date: {s}") from e
 
 
 def _strip_html(html: str) -> str:
@@ -40,10 +46,18 @@ def _strip_html(html: str) -> str:
 
 
 def _find_date(txt: str, label: str) -> datetime:
-    m = re.search(re.escape(label) + r"\s*" + _DATE, txt, flags=re.IGNORECASE)
-    if not m:
-        raise ValueError(f"Could not find date for label: {label}")
-    return _parse_date(m.group(1))
+    # Accept label with/without colon (BMW sometimes changes)
+    label_variants = [label, label.rstrip(":"), label.rstrip(":") + " :"]
+
+    # Date can be numeric (MM/DD/YYYY) OR month-name (January 31, 2026)
+    date_pat = r"([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})"
+
+    for lab in label_variants:
+        m = re.search(re.escape(lab) + r"\s*" + date_pat, txt, flags=re.IGNORECASE)
+        if m:
+            return _parse_date(m.group(1))
+
+    raise ValueError(f"Could not find date for label: {label}")
 
 
 def _find_amount(txt: str, label: str) -> float:
@@ -93,7 +107,11 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
 
     payment_date = _find_date(txt, "Current Payment Date:")
     accrued_interest_date = _find_date(txt, "Accrued Interest Date:")
-    collection_period_ending = _find_date(txt, "Collection Period Ending:")
+    try:
+        collection_period_ending = _find_date(txt, "Collection Period Ending:")
+    except ValueError:
+        # BMW format changes; not needed for engine calcs, so fallback safely
+        collection_period_ending = payment_date
 
     dcf = (payment_date.date() - accrued_interest_date.date()).days / 360.0
 
