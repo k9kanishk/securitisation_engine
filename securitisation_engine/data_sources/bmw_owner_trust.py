@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -59,95 +60,127 @@ def _strip_html(html: str) -> str:
 def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     # Handles MultiIndex columns from read_html
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [" ".join([str(x) for x in col if str(x) != "nan"]).strip() for col in df.columns.values]
-    df.columns = [str(c).strip() for c in df.columns]
+        df.columns = [
+            " ".join([str(x) for x in col if str(x) != "nan"]).strip()
+            for col in df.columns.values
+        ]
+    df.columns = [str(c).strip() if str(c).strip() != "" else f"col_{i}" for i, c in enumerate(df.columns)]
     return df
 
 
-def _find_col(cols_lower, *keywords):
+def _best_col_by_keywords(cols_lower, include_any, include_all=None, exclude_any=None):
+    include_all = include_all or []
+    exclude_any = exclude_any or []
+    best_i, best_score = None, -1
+
     for i, c in enumerate(cols_lower):
-        if all(k in c for k in keywords):
-            return i
-    return None
+        if any(x in c for x in exclude_any):
+            continue
+        if include_all and not all(x in c for x in include_all):
+            continue
+        score = sum(1 for x in include_any if x in c)
+        if score > best_score:
+            best_i, best_score = i, score
+
+    return best_i
+
+
+def _summarize_tables(html: str) -> str:
+    try:
+        tables = pd.read_html(io.StringIO(html), flavor="lxml")
+    except Exception as e:
+        return f"read_html failed: {e}"
+
+    parts = []
+    for i, df in enumerate(tables[:12]):
+        df = _flatten_cols(df)
+        cols = list(df.columns)
+        parts.append(f"[{i}] shape={df.shape} cols={cols[:10]}")
+    return " | ".join(parts)
 
 
 def _parse_tranche_principal_from_tables(html: str):
     """
-    Try to parse a principal roll-forward table from Exhibit 99.1 HTML using read_html.
-    Returns: (begin_bal, prn_paid, end_bal) dicts keyed by tranche short name like 'A-1'
-    """
-    # read_html may throw if no tables
-    tables = pd.read_html(html, flavor="lxml")
-    candidates = []
+    Robust principal roll-forward parser using HTML tables.
 
-    for df in tables:
-        if df is None or df.empty:
+    Returns (begin_bal, prn_paid, end_bal) dicts keyed by tranche short name like 'A-1'
+    """
+    tables = pd.read_html(io.StringIO(html), flavor="lxml")
+    name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
+
+    for raw in tables:
+        if raw is None or raw.empty:
             continue
+
+        df = raw.copy()
         df = _flatten_cols(df)
-        if df.shape[1] < 3:
+        # Drop fully empty rows
+        df = df.dropna(how="all")
+        if df.empty or df.shape[1] < 3:
+            continue
+
+        # Find which column likely contains tranche labels by scanning for "Class ... Notes"
+        str_df = df.astype(str)
+        match_counts = {}
+        for col in df.columns:
+            match_counts[col] = str_df[col].str.contains(name_pat, na=False).sum()
+
+        # If no column has at least 2 matches, this probably isn't the tranche table
+        name_col = max(match_counts, key=match_counts.get)
+        if match_counts[name_col] < 2:
             continue
 
         cols_lower = [c.lower() for c in df.columns]
 
-        # We expect something like:
-        # [Class/Notes] [Beginning ...] [Principal ...] [Ending ...]
-        has_begin = any("begin" in c for c in cols_lower)
-        has_end = any("end" in c for c in cols_lower)
-        has_prn = any(("principal" in c) or ("distribution" in c) or ("payment" in c) for c in cols_lower)
+        # Identify begin/end/principal columns by flexible keyword scoring
+        begin_idx = _best_col_by_keywords(
+            cols_lower,
+            include_any=["begin", "opening"],
+            include_all=["balance"],
+            exclude_any=["end", "ending"],
+        )
+        end_idx = _best_col_by_keywords(
+            cols_lower,
+            include_any=["end", "ending", "closing"],
+            include_all=["balance"],
+            exclude_any=["begin", "opening"],
+        )
+        prn_idx = _best_col_by_keywords(
+            cols_lower,
+            include_any=["principal", "distribution", "payment", "paid"],
+            include_all=[],
+            exclude_any=["interest", "begin", "opening", "end", "ending", "closing", "balance"],
+        )
 
-        if not (has_begin and has_end and has_prn):
+        if begin_idx is None or end_idx is None or prn_idx is None:
+            # not the right table
             continue
 
-        # First column should contain class names
-        first_col = df.iloc[:, 0].astype(str)
-        if not first_col.str.contains("class", case=False, na=False).any():
-            # sometimes it doesn't contain the word 'Class' in every row, but still has tranche names
-            # keep it if it contains 'Notes' in some rows
-            if not first_col.str.contains("notes", case=False, na=False).any():
+        begin_bal, prn_paid, end_bal = {}, {}, {}
+
+        for _, row in df.iterrows():
+            # Try to get tranche name from the detected name column; if not found, scan row
+            m = name_pat.search(str(row[name_col]))
+            if not m:
+                for cell in row.values:
+                    mm = name_pat.search(str(cell))
+                    if mm:
+                        m = mm
+                        break
+            if not m:
                 continue
 
-        candidates.append(df)
+            name = m.group(1).strip()
 
-    if not candidates:
-        return {}, {}, {}
+            begin_bal[name] = _to_float(row.iloc[begin_idx])
+            prn_paid[name] = _to_float(row.iloc[prn_idx])
+            end_bal[name] = _to_float(row.iloc[end_idx])
 
-    # Pick the widest candidate (usually the real principal table)
-    df = max(candidates, key=lambda d: d.shape[1])
-    df = df.copy()
-    df = _flatten_cols(df)
-    cols_lower = [c.lower() for c in df.columns]
+        if begin_bal:
+            return begin_bal, prn_paid, end_bal
 
-    # Identify columns by keywords
-    begin_idx = _find_col(cols_lower, "begin")  # "Beginning Note Balance"
-    end_idx = _find_col(cols_lower, "end")      # "Ending Note Balance"
-
-    # principal column can be "Principal Distribution", "Principal Payment", etc.
-    prn_idx = None
-    for i, c in enumerate(cols_lower):
-        if ("principal" in c or "distribution" in c or "payment" in c) and ("begin" not in c) and ("end" not in c):
-            prn_idx = i
-            break
-
-    if begin_idx is None or end_idx is None or prn_idx is None:
-        return {}, {}, {}
-
-    begin_bal = {}
-    prn_paid = {}
-    end_bal = {}
-
-    name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
-
-    for _, row in df.iterrows():
-        label = str(row.iloc[0])
-        m = name_pat.search(label)
-        if not m:
-            continue
-        name = m.group(1).strip()
-        begin_bal[name] = _to_float(row.iloc[begin_idx])
-        prn_paid[name] = _to_float(row.iloc[prn_idx])
-        end_bal[name] = _to_float(row.iloc[end_idx])
-
-    return begin_bal, prn_paid, end_bal
+    # If we got here, none of the tables parsed
+    return {}, {}, {}
 
 def _find_date(txt: str, label: str) -> datetime:
     # Accept label with/without colon (BMW sometimes changes)
@@ -280,7 +313,11 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
             end_bal[name] = _to_float(e)
 
     if not begin_bal:
-        raise ValueError("Could not parse tranche principal table (begin/pay/end) from Exhibit 99.1")
+        table_summary = _summarize_tables(html)
+        raise ValueError(
+            "Could not parse tranche principal table (begin/pay/end) from Exhibit 99.1. "
+            f"Table scan summary: {table_summary}"
+        )
 
     return BMWParsedStatement(
         payment_date=payment_date,
