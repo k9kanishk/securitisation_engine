@@ -11,6 +11,11 @@ def _safe_div(n: float, d: float) -> float:
     return n / d if d != 0 else float("inf")
 
 
+def _r2(x: float) -> float:
+    # stable 2dp rounding to avoid float artifacts
+    return float(round((x or 0.0) + 1e-9, 2))
+
+
 def _alloc_pro_rata(names: List[str], total: float, balances: Dict[str, float]) -> Dict[str, float]:
     """
     Allocate 'total' across 'names' pro-rata by balances, rounded to cents.
@@ -78,7 +83,7 @@ def run_waterfall(
         st = tranche_states[t.name]
         tr_dcf = t.dcf if t.dcf is not None else base_dcf
         due = st.opening_balance * t.coupon * tr_dcf + st.interest_shortfall
-        interest_due[t.name] = max(due, 0.0)
+        interest_due[t.name] = _r2(max(due, 0.0))
 
     # IC test uses first two tranches in the sorted set (still "simplified")
     a_name = non_residual[0].name
@@ -100,8 +105,8 @@ def run_waterfall(
 
     # 1) Fees from interest
     for fee_name, amt in cfg.deal.fees.items():
-        pay = min(interest_avail, max(float(amt), 0.0))
-        interest_avail -= pay
+        pay = _r2(min(interest_avail, max(float(amt), 0.0)))
+        interest_avail = _r2(interest_avail - pay)
         interest_uses.append({"step": f"Fee: {fee_name}", "amount": pay})
 
     # 2) Reserve draw to cover intended interest
@@ -113,9 +118,9 @@ def run_waterfall(
 
     if interest_avail < intended_interest_total and reserve_open > 0:
         need = intended_interest_total - interest_avail
-        reserve_draw = min(reserve_open, need)
-        reserve_open -= reserve_draw
-        interest_avail += reserve_draw
+        reserve_draw = _r2(min(reserve_open, need))
+        reserve_open = _r2(reserve_open - reserve_draw)
+        interest_avail = _r2(interest_avail + reserve_draw)
         interest_uses.append({"step": "Reserve Draw (to cover interest)", "amount": reserve_draw})
 
     # 3) Pay tranche interest
@@ -123,11 +128,11 @@ def run_waterfall(
     interest_shortfall_close: Dict[str, float] = {t.name: 0.0 for t in tranches_sorted}
 
     if ic_breached:
-        pay = min(interest_avail, interest_due[a_name])
-        interest_avail -= pay
+        pay = _r2(min(interest_avail, interest_due[a_name]))
+        interest_avail = _r2(interest_avail - pay)
         interest_paid[a_name] = pay
         interest_uses.append({"step": f"Tranche {a_name} Interest", "amount": pay})
-        interest_shortfall_close[a_name] = interest_due[a_name] - pay
+        interest_shortfall_close[a_name] = _r2(interest_due[a_name] - pay)
 
         for t in non_residual[1:]:
             interest_shortfall_close[t.name] = interest_due[t.name]
@@ -135,10 +140,10 @@ def run_waterfall(
     else:
         for t in non_residual:
             due = interest_due[t.name]
-            pay = min(interest_avail, due)
-            interest_avail -= pay
+            pay = _r2(min(interest_avail, due))
+            interest_avail = _r2(interest_avail - pay)
             interest_paid[t.name] = pay
-            interest_shortfall_close[t.name] = due - pay
+            interest_shortfall_close[t.name] = _r2(due - pay)
             interest_uses.append({"step": f"Tranche {t.name} Interest", "amount": pay})
 
     # 3b) IC breach turbo
@@ -153,13 +158,13 @@ def run_waterfall(
     reserve_target = float(cfg.deal.reserve_target)
     if interest_avail > 0 and reserve_open < reserve_target:
         need = reserve_target - reserve_open
-        reserve_replenish = min(interest_avail, need)
-        interest_avail -= reserve_replenish
-        reserve_open += reserve_replenish
+        reserve_replenish = _r2(min(interest_avail, need))
+        interest_avail = _r2(interest_avail - reserve_replenish)
+        reserve_open = _r2(reserve_open + reserve_replenish)
         interest_uses.append({"step": "Reserve Replenishment (from interest)", "amount": reserve_replenish})
 
     # 5) Residual interest
-    excess_interest = interest_avail
+    excess_interest = _r2(interest_avail)
     if residual_name:
         interest_paid[residual_name] = excess_interest
         interest_uses.append({"step": f"Residual Interest to {residual_name}", "amount": excess_interest})
@@ -187,10 +192,10 @@ def run_waterfall(
     def pay_principal_to(tranche_name: str, amt: float) -> float:
         nonlocal principal_total
         bal = tranche_close[tranche_name]
-        pay = min(principal_total, amt, bal)
-        principal_total -= pay
-        tranche_principal_paid[tranche_name] += pay
-        tranche_close[tranche_name] -= pay
+        pay = _r2(min(principal_total, amt, bal))
+        principal_total = _r2(principal_total - pay)
+        tranche_principal_paid[tranche_name] = _r2(tranche_principal_paid[tranche_name] + pay)
+        tranche_close[tranche_name] = _r2(tranche_close[tranche_name] - pay)
         return pay
 
     if oc_breached:
@@ -229,14 +234,11 @@ def run_waterfall(
                 if principal_total <= 0:
                     principal_uses.append({"step": f"Tranche {n} Principal", "amount": 0.0})
                     continue
-                pay = min(principal_total, alloc[n], tranche_close[n])
-                principal_total -= pay
-                tranche_principal_paid[n] += pay
-                tranche_close[n] -= pay
+                pay = pay_principal_to(n, alloc[n])
                 principal_uses.append({"step": f"Tranche {n} Principal", "amount": pay})
 
     # Residual principal = (unallocated notes principal) + (cap leftover)
-    residual_principal_amt = principal_total + principal_leftover
+    residual_principal_amt = _r2(principal_total + principal_leftover)
     if residual_principal_amt > 0:
         if residual_name:
             tranche_principal_paid[residual_name] += residual_principal_amt
