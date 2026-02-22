@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import List
 
 from .models import DealConfig, TrancheConfig
 
@@ -12,7 +12,8 @@ class EngineConfig:
     tranches: List[TrancheConfig]
 
     def sorted_tranches(self) -> List[TrancheConfig]:
-        return sorted(self.tranches, key=lambda t: t.rank)
+        # residual last, stable name ordering inside rank
+        return sorted(self.tranches, key=lambda t: (t.is_residual, t.rank, t.name))
 
     def non_residual_tranches(self) -> List[TrancheConfig]:
         return [t for t in self.sorted_tranches() if not t.is_residual]
