@@ -11,6 +11,7 @@ import streamlit as st
 from securitisation_engine.data_sources.bmw_owner_trust import (
     fetch_latest_bmw_exhibit991_to_input_xlsx,
 )
+from securitisation_engine.reconciliation import build_reconciliation
 from securitisation_engine.runner import run_ipd_engine
 
 
@@ -23,18 +24,18 @@ def _read_bytes(path: str) -> bytes:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_fetch_bmw_input(cik: str, user_agent: str) -> Tuple[str, str, bytes]:
+def cached_fetch_bmw_input(cik: str, user_agent: str):
     """Fetch latest 10-D and Exhibit 99.1 and return engine input workbook bytes."""
     with tempfile.TemporaryDirectory() as td:
         out_xlsx = str(Path(td) / "bmw_input.xlsx")
-        ten_d_url, ex99_url = fetch_latest_bmw_exhibit991_to_input_xlsx(
-            cik=cik, user_agent=user_agent, out_xlsx=out_xlsx
+        ten_d_url, ex99_url, recon = fetch_latest_bmw_exhibit991_to_input_xlsx(
+            cik=cik, user_agent=user_agent, out_xlsx=out_xlsx, return_recon=True
         )
-        return ten_d_url, ex99_url, _read_bytes(out_xlsx)
+        return ten_d_url, ex99_url, _read_bytes(out_xlsx), recon
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_run_engine(input_excel_bytes: bytes) -> Tuple[bytes, Dict[str, pd.DataFrame]]:
+def cached_run_engine(input_excel_bytes: bytes, exhibit_recon: dict) -> Tuple[bytes, Dict[str, pd.DataFrame]]:
     """Run engine and return IPD pack bytes + DataFrames."""
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -43,11 +44,22 @@ def cached_run_engine(input_excel_bytes: bytes) -> Tuple[bytes, Dict[str, pd.Dat
         output_xlsx = td / "ipd_pack.xlsx"
 
         input_xlsx.write_bytes(input_excel_bytes)
+        # First run to get dfs, then build reconciliation, then re-write once with extra sheet
         dfs = run_ipd_engine(
             input_xlsx=str(input_xlsx),
             template_xlsx=str(template_xlsx),
             output_xlsx=str(output_xlsx),
         )
+
+        recon_df = build_reconciliation(dfs, exhibit_recon)
+
+        dfs = run_ipd_engine(
+            input_xlsx=str(input_xlsx),
+            template_xlsx=str(template_xlsx),
+            output_xlsx=str(output_xlsx),
+            extra_sheets={"Reconciliation": recon_df},
+        )
+
         return output_xlsx.read_bytes(), dfs
 
 
@@ -83,6 +95,7 @@ def main():
     input_bytes = None
     ten_d_url = None
     ex99_url = None
+    exhibit_recon = {}
 
     if mode == "Upload Excel":
         uploaded = st.file_uploader("Upload engine input workbook (Deal / Fees / Tranches)", type=["xlsx"])
@@ -108,7 +121,7 @@ def main():
 
         with st.spinner("Fetching latest 10-D + Exhibit 99.1 from EDGAR..."):
             try:
-                ten_d_url, ex99_url, input_bytes = cached_fetch_bmw_input(
+                ten_d_url, ex99_url, input_bytes, exhibit_recon = cached_fetch_bmw_input(
                     cik=cik.strip(), user_agent=user_agent.strip()
                 )
             except Exception as e:
@@ -117,7 +130,7 @@ def main():
 
     with st.spinner("Running waterfall + building IPD pack..."):
         try:
-            ipd_bytes, dfs = cached_run_engine(input_bytes)
+            ipd_bytes, dfs = cached_run_engine(input_bytes, exhibit_recon)
         except Exception as e:
             st.exception(e)
             return

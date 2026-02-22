@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -15,7 +15,12 @@ from .reporting import (
 from .waterfall import run_waterfall
 
 
-def run_ipd_engine(input_xlsx: str, template_xlsx: str, output_xlsx: str) -> Dict[str, pd.DataFrame]:
+def run_ipd_engine(
+    input_xlsx: str,
+    template_xlsx: str,
+    output_xlsx: str,
+    extra_sheets: Optional[Dict[str, pd.DataFrame]] = None,
+) -> Dict[str, pd.DataFrame]:
     """
     End-to-end engine run:
       - Reads engine input workbook (Deal/Fees/Tranches)
@@ -43,6 +48,9 @@ def run_ipd_engine(input_xlsx: str, template_xlsx: str, output_xlsx: str) -> Dic
         "Note Rollforward": roll,
         "Investor Summary": inv,
     }
+
+    if extra_sheets:
+        dfs.update(extra_sheets)
 
     write_ipd_pack(template_xlsx, output_xlsx, dfs)
     return dfs
