@@ -8,6 +8,11 @@ from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
 
+def _safe_sheet_name(name: str) -> str:
+    name = str(name)
+    return name[:31]
+
+
 def _write_df(ws, df: pd.DataFrame, start_row: int, start_col: int, header: bool = True, number_format: str = "#,##0.00"):
     bold = Font(bold=True)
     align = Alignment(vertical="top")
@@ -62,7 +67,7 @@ def ensure_template(path: str) -> None:
         "Note Rollforward",
         "Investor Summary",
     ]:
-        wb.create_sheet(name)
+        wb.create_sheet(_safe_sheet_name(name))
 
     wb.save(path)
 
@@ -75,9 +80,10 @@ def write_ipd_pack(
     wb = load_workbook(template_path)
 
     for sheet_name, df in dfs.items():
-        if sheet_name not in wb.sheetnames:
-            wb.create_sheet(sheet_name)
-        ws = wb[sheet_name]
+        safe = _safe_sheet_name(sheet_name)
+        if safe not in wb.sheetnames:
+            wb.create_sheet(safe)
+        ws = wb[safe]
         ws.delete_rows(1, ws.max_row)  # clear
         _write_df(ws, df, start_row=1, start_col=1, header=True)
 
