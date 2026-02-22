@@ -88,6 +88,101 @@ def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _table_cells(df: pd.DataFrame):
+    # Flatten multi-index columns if any, and drop empty rows
+    df = _flatten_cols(df).dropna(how="all")
+    return df
+
+
+def _row_contains(row, label: str) -> bool:
+    lab = label.lower()
+    return any(lab in str(x).lower() for x in row.values)
+
+
+def _row_numbers(row, min_abs: float = 0.0) -> list[float]:
+    nums = []
+    for x in row.values:
+        v = _try_parse_money(x)
+        if v is None:
+            continue
+        if abs(v) >= min_abs:
+            nums.append(float(v))
+    return nums
+
+
+def _find_row_amount_in_tables(tables: list[pd.DataFrame], label: str, *, min_abs: float = 1000.0) -> float:
+    """
+    Finds a row containing 'label' in ANY table and returns a numeric amount from that row.
+    We default min_abs=1000 to avoid picking up ratios / per-$1000 / period numbers.
+    """
+    for df in tables:
+        df = _table_cells(df)
+        for _, row in df.iterrows():
+            if _row_contains(row, label):
+                nums = _row_numbers(row, min_abs=min_abs)
+                if nums:
+                    # usually the amount is the last/only big number
+                    return nums[-1]
+    raise ValueError(f"Could not find numeric amount for '{label}' in HTML tables")
+
+
+def _find_row_triplet_in_tables(tables: list[pd.DataFrame], label: str, *, min_abs: float = 1000.0) -> list[float]:
+    """
+    For rows like Pool Balance / Reserve Account that show Initial / Beginning / End.
+    Returns first 3 big numbers found.
+    """
+    for df in tables:
+        df = _table_cells(df)
+        for _, row in df.iterrows():
+            if _row_contains(row, label):
+                nums = _row_numbers(row, min_abs=min_abs)
+                if len(nums) >= 3:
+                    return nums[:3]
+    raise ValueError(f"Could not find 3 numeric values for '{label}' in HTML tables")
+
+
+def _find_interest_rate_table(tables: list[pd.DataFrame]) -> pd.DataFrame | None:
+    """
+    Finds the 'Interest Distributable Amount' table.
+    """
+    for df in tables:
+        df2 = _table_cells(df)
+        # detect table by presence of this header text in any cell
+        if df2.astype(str).apply(lambda col: col.str.contains("Interest Distributable Amount", case=False, na=False)).any().any():
+            return df2
+    return None
+
+
+def _parse_tranche_coupons_from_interest_table(df: pd.DataFrame) -> dict[str, float]:
+    """
+    Parses coupon rates from the Interest Distributable Amount table.
+    Heuristic: in each tranche row, the first small number (0<rate<30) is the rate %.
+    """
+    name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
+    coupons = {}
+
+    for _, row in df.iterrows():
+        row_text = " ".join(str(x) for x in row.values)
+        m = name_pat.search(row_text)
+        if not m:
+            continue
+        name = m.group(1).strip()
+
+        # collect small numerics (rates/payments/per1000)
+        small = []
+        for x in row.values:
+            v = _try_parse_money(x)
+            if v is None:
+                continue
+            v = float(v)
+            if 0.0 < v < 30.0:
+                small.append(v)
+
+        if small:
+            coupons[name] = small[0] / 100.0  # percent -> decimal
+    return coupons
+
+
 def _best_col_by_keywords(cols_lower, include_any, include_all=None, exclude_any=None):
     include_all = include_all or []
     exclude_any = exclude_any or []
@@ -298,6 +393,7 @@ class BMWParsedStatement:
 
 def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
     txt = _strip_html(html)
+    tables = pd.read_html(io.StringIO(html), flavor="lxml")
 
     payment_date = _find_date(txt, "Current Payment Date:")
     accrued_interest_date = _find_date(txt, "Accrued Interest Date:")
@@ -309,17 +405,19 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
 
     dcf = (payment_date.date() - accrued_interest_date.date()).days / 360.0
 
-    # Pool Balance table has three columns: Beginning / End / Initial
-    pool_bal_begin, pool_bal_end, _pool_bal_initial = _find_amounts_after(txt, "Pool Balance", 3)
+    # --- Balances table (Initial / Beginning / End) ---
+    pool_triplet = _find_row_triplet_in_tables(tables, "Pool Balance", min_abs=1000.0)
+    pool_bal_initial, pool_bal_begin, pool_bal_end = pool_triplet[0], pool_triplet[1], pool_triplet[2]
 
-    # Reserve Account also shows three columns; opening is the first value
-    reserve_open, _reserve_end, _reserve_initial = _find_amounts_after(txt, "Reserve Account", 3)
+    reserve_triplet = _find_row_triplet_in_tables(tables, "Reserve Account", min_abs=1000.0)
+    reserve_initial, reserve_begin, reserve_end = reserve_triplet[0], reserve_triplet[1], reserve_triplet[2]
 
-    total_avail_int = _find_amount(txt, "Total Available Interest")
-    total_avail_prn = _find_amount(txt, "Total Available Principal")
+    # --- Available funds totals ---
+    total_avail_int = _find_row_amount_in_tables(tables, "Total Available Interest", min_abs=1000.0)
+    total_avail_prn = _find_row_amount_in_tables(tables, "Total Available Principal", min_abs=1000.0)
 
+    # --- Fees from Distributions list ---
     fees = {}
-    # Common BMW line items in Exhibit 99.1
     for fee_label in [
         "Servicing Fees",
         "Non-recoverable Servicer Advance Reimbursement",
@@ -327,22 +425,16 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
         "Amounts paid to Indenture Trustee, Owner Trustee and Asset Representations Reviewer (not subject to annual cap)",
     ]:
         try:
-            fees[fee_label] = _find_amount(txt, fee_label)
+            fees[fee_label] = _find_row_amount_in_tables(tables, fee_label, min_abs=0.0)  # can be 0.00
         except ValueError:
-            # not always present / sometimes 0 with weird formatting
             continue
 
-    # Interest table parsing (Class ... Notes, rate %, payment $)
-    # Example text chunk:
-    # "Class A-1 Notes 4.40100 % $ 853,722.95"
-    interest_pat = re.compile(
-        r"(Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes)\s+([0-9]+\.[0-9]+)\s*%\s*\$\s*" + _MONEY,
-        flags=re.IGNORECASE,
-    )
-    tranche_coupon: Dict[str, float] = {}
-    for _full, short, rate, pay in interest_pat.findall(txt):
-        name = short.strip()
-        tranche_coupon[name] = float(rate) / 100.0
+    # --- Coupons from Interest Distributable table ---
+    interest_tbl = _find_interest_rate_table(tables)
+    tranche_coupon = _parse_tranche_coupons_from_interest_table(interest_tbl) if interest_tbl is not None else {}
+
+    reserve_opening = reserve_begin
+    pool_balance_end = pool_bal_end
 
     # --- Tranche principal roll-forward: use HTML tables first (robust) ---
     begin_bal, prn_paid, end_bal = _parse_tranche_principal_from_tables(html)
@@ -381,8 +473,8 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
         accrued_interest_date=accrued_interest_date,
         collection_period_ending=collection_period_ending,
         day_count_fraction_act_360=dcf,
-        pool_balance_end=pool_bal_end,
-        reserve_opening=reserve_open,
+        pool_balance_end=pool_balance_end,
+        reserve_opening=reserve_opening,
         total_available_interest=total_avail_int,
         total_available_principal=total_avail_prn,
         fees=fees,

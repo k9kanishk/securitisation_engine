@@ -60,11 +60,11 @@ def build_note_rollforward(cfg: EngineConfig, res: WaterfallResults, tranche_ope
 
 def build_investor_summary(period: PeriodInputs, res: WaterfallResults) -> pd.DataFrame:
     rows = [
-        {"metric": "Payment Date", "value": period.payment_date},
-        {"metric": "OC Ratio", "value": res.oc_ratio},
+        {"metric": "Payment Date", "value": str(period.payment_date)},
+        {"metric": "OC Ratio", "value": str(res.oc_ratio)},
         {"metric": "OC Trigger Breached", "value": str(res.oc_breached)},
-        {"metric": "IC Ratio", "value": res.ic_ratio},
+        {"metric": "IC Ratio", "value": str(res.ic_ratio)},
         {"metric": "IC Trigger Breached", "value": str(res.ic_breached)},
-        {"metric": "Reserve Closing", "value": res.reserve_closing},
+        {"metric": "Reserve Closing", "value": str(res.reserve_closing)},
     ]
     return pd.DataFrame(rows)
