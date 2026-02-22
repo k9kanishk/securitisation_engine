@@ -183,6 +183,35 @@ def _parse_tranche_coupons_from_interest_table(df: pd.DataFrame) -> dict[str, fl
     return coupons
 
 
+def _parse_tranche_interest_paid_from_interest_table(df: pd.DataFrame) -> dict[str, float]:
+    """
+    Parses the 'Current Payment' amounts from the Interest Distributable Amount table.
+    Heuristic: for each tranche row, the largest number >= 1,000 is the payment amount.
+    """
+    name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
+    pays: Dict[str, float] = {}
+
+    for _, row in df.iterrows():
+        row_text = " ".join(str(x) for x in row.values)
+        m = name_pat.search(row_text)
+        if not m:
+            continue
+        name = m.group(1).strip()
+
+        nums = []
+        for x in row.values:
+            v = _try_parse_money(x)
+            if v is None:
+                continue
+            v = float(v)
+            if abs(v) >= 1000.0:
+                nums.append(v)
+
+        pays[name] = float(max(nums, key=abs)) if nums else 0.0
+
+    return pays
+
+
 def _best_col_by_keywords(cols_lower, include_any, include_all=None, exclude_any=None):
     include_all = include_all or []
     exclude_any = exclude_any or []
@@ -386,6 +415,7 @@ class BMWParsedStatement:
 
     # tranche info keyed by name like "A-1", "A-2a"...
     tranche_coupon: Dict[str, float]          # annual % as decimal, from statement interest rate
+    tranche_interest_paid_exhibit: Dict[str, float]  # NEW: current payment from interest table
     tranche_begin_balance: Dict[str, float]
     tranche_principal_paid: Dict[str, float]
     tranche_end_balance: Dict[str, float]
@@ -432,6 +462,7 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
     # --- Coupons from Interest Distributable table ---
     interest_tbl = _find_interest_rate_table(tables)
     tranche_coupon = _parse_tranche_coupons_from_interest_table(interest_tbl) if interest_tbl is not None else {}
+    tranche_interest_paid_exhibit = _parse_tranche_interest_paid_from_interest_table(interest_tbl) if interest_tbl is not None else {}
 
     reserve_opening = reserve_begin
     pool_balance_end = pool_bal_end
@@ -479,6 +510,7 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
         total_available_principal=total_avail_prn,
         fees=fees,
         tranche_coupon=tranche_coupon,
+        tranche_interest_paid_exhibit=tranche_interest_paid_exhibit,
         tranche_begin_balance=begin_bal,
         tranche_principal_paid=prn_paid,
         tranche_end_balance=end_bal,
@@ -487,69 +519,85 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
 
 def build_engine_input_excel(parsed: BMWParsedStatement, out_xlsx: str) -> None:
     """
-    Writes your engine's expected input workbook:
+    Writes engine input workbook:
       - Deal (key/value)
       - Fees (fee_name/amount)
-      - Tranches (name/rank/coupon/opening_balance/is_residual)
-
-    Notes:
-      - BMW has many note classes; we load each class as a tranche.
-      - Add a residual "Certificates" tranche for convenience.
-      - Tranche rank order is inferred: A-1, A-2a, A-2b, A-3, A-4, ... then Certificates.
+      - Tranches (name/rank/coupon/opening_balance/is_residual/dcf)
     """
-    # Build tranches list
     def rank_key(n: str) -> Tuple[int, str]:
-        # crude ordering for common BMW naming
-        # A-1 < A-2a < A-2b < A-3 < A-4 ...; fallback lexicographic
         m = re.match(r"^A-(\d+)([a-z]?)$", n, flags=re.IGNORECASE)
         if m:
             num = int(m.group(1))
             suf = m.group(2) or ""
-            # 'a' before 'b' etc
             return (num, suf)
         return (999, n.lower())
 
+    def rank_from_name(n: str) -> int:
+        m = re.match(r"^A-(\d+)", n, flags=re.IGNORECASE)
+        return int(m.group(1)) if m else 999
+
     note_names = sorted(parsed.tranche_begin_balance.keys(), key=rank_key)
 
+    # infer tranche-specific dcf from Exhibit interest payments
+    act_dcf = float(parsed.day_count_fraction_act_360)
+    dcf_30_360 = 30.0 / 360.0
+
+    def snap_dcf(x: float) -> float:
+        if abs(x - dcf_30_360) < 1e-4:
+            return dcf_30_360
+        if abs(x - act_dcf) < 1e-4:
+            return act_dcf
+        return x
+
+    dcf_by_tranche: Dict[str, float] = {}
+    for name in note_names:
+        pay = float(parsed.tranche_interest_paid_exhibit.get(name, 0.0))
+        bal = float(parsed.tranche_begin_balance.get(name, 0.0))
+        cpn = float(parsed.tranche_coupon.get(name, 0.0))
+        if pay > 0 and bal > 0 and cpn > 0:
+            implied = pay / (bal * cpn)
+            dcf_by_tranche[name] = snap_dcf(implied)
+        else:
+            dcf_by_tranche[name] = act_dcf
+
+    # principal cap to notes = sum of Exhibit note principal payments
+    principal_to_notes_cap = float(sum(float(parsed.tranche_principal_paid.get(n, 0.0)) for n in note_names))
+
     tr_rows = []
-    for i, name in enumerate(note_names, start=1):
-        coupon = parsed.tranche_coupon.get(name, 0.0)  # sometimes fixed notes; should parse fine
+    for name in note_names:
         tr_rows.append(
             {
                 "name": name,
-                "rank": i,
-                "coupon": coupon,
+                "rank": rank_from_name(name),  # A-2a and A-2b both -> 2
+                "coupon": float(parsed.tranche_coupon.get(name, 0.0)),
                 "opening_balance": float(parsed.tranche_begin_balance[name]),
                 "is_residual": False,
+                "dcf": float(dcf_by_tranche.get(name, act_dcf)),
             }
         )
 
     # Residual
     tr_rows.append(
-        {"name": "Certificates", "rank": 99, "coupon": 0.0, "opening_balance": 0.0, "is_residual": True}
+        {"name": "Certificates", "rank": 99, "coupon": 0.0, "opening_balance": 0.0, "is_residual": True, "dcf": None}
     )
-
     tranches_df = pd.DataFrame(tr_rows)
 
     deal_df = pd.DataFrame(
         [
             {"key": "payment_date", "value": parsed.payment_date.strftime("%Y-%m-%d")},
-            {"key": "day_count_fraction", "value": parsed.day_count_fraction_act_360},
-            # BMW statement doesn't publish OC/IC triggers in a simple way; keep these inert
+            {"key": "day_count_fraction", "value": act_dcf},  # base fallback
             {"key": "oc_trigger", "value": 0.0},
             {"key": "ic_trigger", "value": 0.0},
-            # reserve target: BMW often holds a specified balance; use opening as a proxy
             {"key": "reserve_target", "value": parsed.reserve_opening},
             {"key": "reserve_opening", "value": parsed.reserve_opening},
             {"key": "collateral_balance", "value": parsed.pool_balance_end},
             {"key": "interest_collections", "value": parsed.total_available_interest},
             {"key": "principal_collections", "value": parsed.total_available_principal},
+            {"key": "principal_to_notes_cap", "value": principal_to_notes_cap},  # NEW
         ]
     )
 
-    fees_df = pd.DataFrame(
-        [{"fee_name": k, "amount": float(v)} for k, v in parsed.fees.items()]
-    )
+    fees_df = pd.DataFrame([{"fee_name": k, "amount": float(v)} for k, v in parsed.fees.items()])
     if fees_df.empty:
         fees_df = pd.DataFrame([{"fee_name": "Servicing Fees", "amount": 0.0}])
 

@@ -1,35 +1,37 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
 class TrancheConfig:
-    name: str                 # "A", "B", "C"
-    rank: int                 # 1=senior, 2=mezz, 3=junior
-    coupon: float             # annual coupon, e.g. 0.05
-    is_residual: bool = False # True for equity-like residual tranche
+    name: str
+    rank: int
+    coupon: float
+    is_residual: bool = False
+    dcf: Optional[float] = None  # NEW: tranche-specific day count fraction
 
 
 @dataclass
 class TrancheState:
     opening_balance: float
-    interest_shortfall: float = 0.0  # carried unpaid interest
+    interest_shortfall: float = 0.0
 
 
 @dataclass(frozen=True)
 class DealConfig:
-    day_count_fraction: float         # e.g. 0.25 for quarterly
-    oc_trigger: float                 # e.g. 1.10
-    ic_trigger: float                 # e.g. 1.05
-    reserve_target: float             # absolute target balance
-    fees: Dict[str, float]            # e.g. {"Servicer Fee": 2000, "Trustee Fee": 500}
+    day_count_fraction: float
+    oc_trigger: float
+    ic_trigger: float
+    reserve_target: float
+    fees: Dict[str, float]
+    principal_to_notes_cap: Optional[float] = None  # NEW
 
 
 @dataclass(frozen=True)
 class PeriodInputs:
-    payment_date: str                 # string for reporting (YYYY-MM-DD)
+    payment_date: str
     collateral_balance: float
     interest_collections: float
     principal_collections: float
