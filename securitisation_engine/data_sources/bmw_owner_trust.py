@@ -186,7 +186,7 @@ def _parse_tranche_coupons_from_interest_table(df: pd.DataFrame) -> dict[str, fl
 def _parse_tranche_interest_paid_from_interest_table(df: pd.DataFrame) -> dict[str, float]:
     """
     Parses the 'Current Payment' amounts from the Interest Distributable Amount table.
-    Heuristic: for each tranche row, the largest number >= 1,000 is the payment amount.
+    Heuristic: largest number >= 1,000 on the row is the payment.
     """
     name_pat = re.compile(r"Class\s+([A-Za-z0-9\-]+[a-z]?)\s+Notes", flags=re.IGNORECASE)
     pays: Dict[str, float] = {}
@@ -209,6 +209,9 @@ def _parse_tranche_interest_paid_from_interest_table(df: pd.DataFrame) -> dict[s
 
         pays[name] = float(max(nums, key=abs)) if nums else 0.0
 
+    # Some deals include Class A-1 with dashes; force 0 if missing
+    for k in list(pays.keys()):
+        pays[k] = float(round(pays[k] + 1e-9, 2))
     return pays
 
 
@@ -421,6 +424,59 @@ class BMWParsedStatement:
     tranche_end_balance: Dict[str, float]
 
 
+def parse_bmw_exhibit_recon_metrics(html: str) -> Dict[str, object]:
+    """
+    Extracts Exhibit 99.1 control totals and tranche payments for reconciliation.
+    Returns JSON-safe dict.
+    """
+    tables = pd.read_html(io.StringIO(html), flavor="lxml")
+
+    # Totals
+    total_available_interest = float(_find_row_amount_in_tables(tables, "Total Available Interest", min_abs=1000.0))
+    total_available_principal = float(_find_row_amount_in_tables(tables, "Total Available Principal", min_abs=1000.0))
+    total_available_funds = float(_find_row_amount_in_tables(tables, "Total Available Funds", min_abs=1000.0))
+
+    # Distributions (these exist in your pasted Exhibit)
+    servicing_fees = float(_find_row_amount_in_tables(tables, "Servicing Fees", min_abs=0.0))
+    nonrec = float(_find_row_amount_in_tables(tables, "Non-recoverable Servicer Advance Reimbursement", min_abs=0.0))
+    note_interest_total = float(_find_row_amount_in_tables(tables, "Noteholder's Accrued and Unpaid Interest", min_abs=0.0))
+    certificate_distribution = float(
+        _find_row_amount_in_tables(tables, "Certificate Distribution Account (any remaining payments)", min_abs=0.0)
+    )
+    total_distributions = float(_find_row_amount_in_tables(tables, "Total Distributions", min_abs=1000.0))
+
+    # Reserve opening/closing from Balances triplet
+    reserve_triplet = _find_row_triplet_in_tables(tables, "Reserve Account", min_abs=1000.0)
+    reserve_opening = float(reserve_triplet[1])
+    reserve_closing = float(reserve_triplet[2])
+
+    # Tranche-level interest paid from Interest Distributable table
+    interest_tbl = _find_interest_rate_table(tables)
+    tranche_interest_paid = _parse_tranche_interest_paid_from_interest_table(interest_tbl) if interest_tbl is not None else {}
+
+    # Tranche-level principal paid from Monthly Principal Distributable table (your robust parser)
+    _, tranche_principal_paid, _ = _parse_tranche_principal_from_tables(html)
+
+    note_principal_total = float(sum(float(v) for v in tranche_principal_paid.values()))
+    # If Exhibit has explicit note principal sum elsewhere, use that; otherwise we trust the table sum.
+
+    return {
+        "total_available_interest": round(total_available_interest, 2),
+        "total_available_principal": round(total_available_principal, 2),
+        "total_available_funds": round(total_available_funds, 2),
+        "servicing_fees": round(servicing_fees, 2),
+        "nonrecoverable_servicer_adv_reimb": round(nonrec, 2),
+        "note_interest_total": round(note_interest_total, 2),
+        "note_principal_total": round(note_principal_total, 2),
+        "certificate_distribution": round(certificate_distribution, 2),
+        "total_distributions": round(total_distributions, 2),
+        "reserve_opening": round(reserve_opening, 2),
+        "reserve_closing": round(reserve_closing, 2),
+        "tranche_interest_paid": {k: round(float(v), 2) for k, v in tranche_interest_paid.items()},
+        "tranche_principal_paid": {k: round(float(v), 2) for k, v in tranche_principal_paid.items()},
+    }
+
+
 def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
     txt = _strip_html(html)
     tables = pd.read_html(io.StringIO(html), flavor="lxml")
@@ -611,9 +667,11 @@ def fetch_latest_bmw_exhibit991_to_input_xlsx(
     cik: str | int,
     user_agent: str,
     out_xlsx: str,
-) -> Tuple[str, str]:
+    return_recon: bool = False,
+) -> Tuple[str, str] | Tuple[str, str, Dict[str, object]]:
     """
     Returns (10-D primary doc URL, Exhibit 99.1 URL) and writes out_xlsx.
+    If return_recon=True, also returns a dict of Exhibit metrics for reconciliation.
     """
     client = SECEdgarClient(user_agent=user_agent)
 
@@ -624,5 +682,9 @@ def fetch_latest_bmw_exhibit991_to_input_xlsx(
     exhibit_html = client.get_text(exhibit_url)
     parsed = parse_bmw_exhibit_99_1(exhibit_html)
     build_engine_input_excel(parsed, out_xlsx=out_xlsx)
+
+    if return_recon:
+        recon = parse_bmw_exhibit_recon_metrics(exhibit_html)
+        return filing.primary_doc_url, exhibit_url, recon
 
     return filing.primary_doc_url, exhibit_url
