@@ -75,6 +75,141 @@ def _strip_html(html: str) -> str:
     return txt
 
 
+def _extract_any_date(text: str) -> datetime | None:
+    """
+    Finds the first date-like token inside arbitrary text and parses it.
+    Supports:
+      - 03/26/26
+      - 03/26/2026
+      - March 26, 2026
+      - Mar 26, 2026
+      - 2026-03-26
+    """
+    if text is None:
+        return None
+
+    s = str(text).strip()
+    if not s:
+        return None
+
+    pats = [
+        r"([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+        r"(\d{1,2}/\d{1,2}/\d{2,4})",
+        r"(\d{4}-\d{2}-\d{2})",
+    ]
+
+    for pat in pats:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m:
+            try:
+                return _parse_date(m.group(1))
+            except Exception:
+                pass
+    return None
+
+
+def _find_date_by_labels_in_text(txt: str, labels: list[str]) -> datetime | None:
+    """
+    Tries several label variants in flattened text.
+    """
+    date_pat = r"([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})"
+
+    for label in labels:
+        variants = [label, label.rstrip(":"), label.rstrip(":") + ":"]
+        for lab in variants:
+            m = re.search(re.escape(lab) + r"\s*" + date_pat, txt, flags=re.IGNORECASE)
+            if m:
+                try:
+                    return _parse_date(m.group(1))
+                except Exception:
+                    pass
+    return None
+
+
+def _find_date_in_tables(tables: list[pd.DataFrame], labels: list[str]) -> datetime | None:
+    """
+    Scans table rows/cells for a label and then tries to parse a date from the same row.
+    Also checks the next row, because BMW often splits label and value across rows/cells.
+    """
+    labels_l = [x.lower().rstrip(":").strip() for x in labels]
+
+    for raw in tables:
+        df = _table_cells(raw)
+        if df.empty:
+            continue
+
+        str_df = df.astype(str)
+
+        for i in range(len(str_df)):
+            row_vals = [str(x) for x in str_df.iloc[i].tolist()]
+            row_text = " ".join(row_vals).strip().lower()
+
+            matched = any(lbl in row_text for lbl in labels_l)
+            if not matched:
+                continue
+
+            # try same row
+            dt = _extract_any_date(" ".join(row_vals))
+            if dt is not None:
+                return dt
+
+            # try next row if exists
+            if i + 1 < len(str_df):
+                next_vals = [str(x) for x in str_df.iloc[i + 1].tolist()]
+                dt = _extract_any_date(" ".join(next_vals))
+                if dt is not None:
+                    return dt
+
+            # try label cell neighbors individually
+            for val in row_vals:
+                dt = _extract_any_date(val)
+                if dt is not None:
+                    return dt
+
+    return None
+
+
+def _find_distribution_date_from_title(txt: str) -> datetime | None:
+    """
+    Fallback for titles like:
+    'STATEMENT RELATING TO THE MARCH 26, 2026 DISTRIBUTION'
+    """
+    m = re.search(
+        r"statement\s+relating\s+to\s+the\s+([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\s+distribution",
+        txt,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        try:
+            return _parse_date(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _resolve_date(txt: str, tables: list[pd.DataFrame], labels: list[str], fallback_title: bool = False) -> datetime | None:
+    """
+    Unified resolver:
+      1) flattened text
+      2) tables
+      3) statement title
+    """
+    dt = _find_date_by_labels_in_text(txt, labels)
+    if dt is not None:
+        return dt
+
+    dt = _find_date_in_tables(tables, labels)
+    if dt is not None:
+        return dt
+
+    if fallback_title:
+        dt = _find_distribution_date_from_title(txt)
+        if dt is not None:
+            return dt
+
+    return None
+
+
 
 
 def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -367,17 +502,12 @@ def _parse_tranche_principal_from_tables(html: str):
     return begin_bal, prn_paid, end_bal
 
 def _find_date(txt: str, label: str) -> datetime:
-    # Accept label with/without colon (BMW sometimes changes)
-    label_variants = [label, label.rstrip(":"), label.rstrip(":") + " :"]
-
-    # Date can be numeric (MM/DD/YYYY) OR month-name (January 31, 2026)
-    date_pat = r"([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})"
-
-    for lab in label_variants:
-        m = re.search(re.escape(lab) + r"\s*" + date_pat, txt, flags=re.IGNORECASE)
-        if m:
-            return _parse_date(m.group(1))
-
+    """
+    Backward-compatible single-label wrapper.
+    """
+    dt = _find_date_by_labels_in_text(txt, [label])
+    if dt is not None:
+        return dt
     raise ValueError(f"Could not find date for label: {label}")
 
 
@@ -481,12 +611,51 @@ def parse_bmw_exhibit_99_1(html: str) -> BMWParsedStatement:
     txt = _strip_html(html)
     tables = pd.read_html(io.StringIO(html), flavor="lxml")
 
-    payment_date = _find_date(txt, "Current Payment Date:")
-    accrued_interest_date = _find_date(txt, "Accrued Interest Date:")
-    try:
-        collection_period_ending = _find_date(txt, "Collection Period Ending:")
-    except ValueError:
-        # BMW format changes; not needed for engine calcs, so fallback safely
+    payment_date = _resolve_date(
+        txt,
+        tables,
+        labels=[
+            "Current Payment Date",
+            "Payment Date",
+            "Distribution Date",
+            "Current Distribution Date",
+        ],
+        fallback_title=True,
+    )
+    if payment_date is None:
+        raise ValueError(
+            "Could not find payment/distribution date in Exhibit 99.1 "
+            "(labels and statement-title fallback all failed)."
+        )
+
+    accrued_interest_date = _resolve_date(
+        txt,
+        tables,
+        labels=[
+            "Accrued Interest Date",
+            "Accrual Date",
+            "Interest Accrual Date",
+        ],
+        fallback_title=False,
+    )
+    if accrued_interest_date is None:
+        raise ValueError(
+            "Could not find accrued interest date in Exhibit 99.1."
+        )
+
+    collection_period_ending = _resolve_date(
+        txt,
+        tables,
+        labels=[
+            "Collection Period Ending",
+            "Collection Period End",
+            "Collection Period Ending Date",
+            "Collection Period End Date",
+        ],
+        fallback_title=False,
+    )
+    if collection_period_ending is None:
+        # safe fallback; not critical for your current engine
         collection_period_ending = payment_date
 
     dcf = (payment_date.date() - accrued_interest_date.date()).days / 360.0
